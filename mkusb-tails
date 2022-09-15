@@ -1,0 +1,361 @@
+#! /bin/bash
+
+#-----------------------------------------------------------------------------
+#
+## Copyright 2017-2020 Nio Wiklund, Modified in 2022 by Ben Westgate
+#
+# GPLv3: GNU GPL version 3
+# <http://gnu.org/licenses/gpl.html>.
+#
+# This is free software: you are free to change and redistribute it.
+# There is NO WARRANTY, to the extent permitted by law.
+
+# date        editor   comment
+# 20160226    sudodus  created from mk_mkdos in mkusb
+# 20171217    sudodus  converted to clone-to-pendrive
+# 20171217    sudodus  checking for mass storage devices as target
+# 20171218    sudodus  error output to help correct usage
+# 20191008    sudodus  creating persistence for Ubuntu 19.10 & Debian 10
+# 20191009    sudodus  seek last partition; grep ... 2> /dev/null
+# 20191010    sudodus  function prober and other tweaks with partprobe
+# 20191114    sudodus  'nopersistent' for fully non-persistent live drive
+# 20191214    sudodus  bugfix in main for targ_dev=; minor fix in srctst
+# 20220913    benwest  hardcoded source to Tails dev, target by insert, clones with tails-installer
+
+version=2.4
+
+# global variables
+
+inversvid="\0033[7m"
+resetvid="\0033[0m"
+greenback="\0033[1;37;42m"
+blueback="\0033[1;37;44m"
+redback="\0033[1;37;41m"
+safetybelt="This shellsript wraps a safety belt around 'dd'"
+safetybelt="$inversvid               $safetybelt               $resetvid"
+target=
+partn0=
+partnr=
+success=
+bar="--------------------------------------------------------------------------------"
+RUNNING_TAILS_DEV="$(mount | grep /lib/live/mount/medium | cut -f1 -d' ' | head -c-2)"
+
+########################################################################
+########################################################################
+
+function prober {
+
+pcnt=0
+partnr=/dev/$(lsblk -l -o name "${target}" | tail -n1)
+while [ "$partnr" == "$partn0" ]
+do
+ if [ $pcnt -gt 15 ]
+ then
+  echo "$redback cannot identify new partition made by fdisk $resetvid"
+  exit
+ fi
+ partprobe 2> /dev/null
+ sleep 2
+ pcnt=$((pcnt + 1))
+ partnr=/dev/$(lsblk -l -o name "${target}" | tail -n1)
+ echo "prober: $partnr for persistence"
+done
+}
+########################################################################
+########################################################################
+
+function usage {
+
+ /bin/echo -e "$safetybelt"
+ echo "Clone Tails from running device to a target device (typically a USB pendrive)"
+ echo "Usage:"
+ /bin/echo -e "$inversvid sudo /path/${0##*/} <target device> $resetvid"
+ echo "Persistence: for Tails"
+ echo " sudo $0 --self             # add persistence to running live drive"
+ echo " sudo $0 /dev/sdx           # add persistence to a specified drive"
+ echo " sudo $0                    # add persistence to next inserted drive"
+ echo "Help:"
+ echo "$0 -h"
+ echo "Version:"
+ echo "$0 -v"
+ /bin/echo -e "$blueback${inversvid}Available devices (tran-MODEL  device),$resetvid
+$inversvid${targ_dev}${resetvid}"
+ exit
+}
+########################################################################
+########################################################################
+#
+# main program
+#
+########################################################################
+########################################################################
+
+# identify possible target devices
+
+usb_dev=$(ls -l /dev/disk/by-id|grep usb|grep -v 'part.*->' \
+|sed -e 's/.*usb-/usb-/' -e 's#../..#/dev#' -e 's/^/ /' -e 's/$/ /'|sort -k3)
+
+targ_dev=$(find /dev/disk/by-id -type l -ls \
+|sed -e 's/^/ /' \
+|tr -s ' ' ' '|cut -d ' ' -f 12,14 \
+|grep -v '/dev/disk/by-id/wwn-'|grep -v 'part[1-9] ../../' \
+|sed -e 's%/dev/disk/by-id/%%' -e 's%../../% /dev/%'|sort -k2 \
+|sed -e 's/^/ /' -e 's/$/ /')
+
+# print version and help text on demand
+
+if [ "$1" == "-v" ]
+then
+ echo "${0##*/} version $version"
+ exit
+elif [ "$1" == "-h" ]
+then
+ usage
+elif [ "$1" == "--self" ]
+then
+ target="$RUNNING_TAILS_DEV" # running tails device
+elif [ "$1" ]
+then
+ target="$1"	# specified device.
+fi
+if [ "$(whoami)" != "root" ]
+then
+ /bin/echo -e "$redback Run '${0##*/}' with sudo or as root $resetvid"
+fi
+
+# unmount and power off all non-target devices for safety.
+
+device=$(echo -e "$targ_dev" | awk '{print $2}' | grep -v "$RUNNING_TAILS_DEV")
+[ "$target" ] && device=$(echo -e "$device" | grep -v "$target")	# removes target device
+[ "$(whoami)" != "root" ] || for dev in $device; do
+	echo "Trying to unmount partitions if mounted on the non-target device $dev"
+	umount "$dev"*
+	df | grep "$dev"
+	if [ $? -eq 0 ]
+	then
+ 		echo -e "$redback pder: could not unmount a partition on non-target device $resetvid"
+ 		exit
+	fi
+	udisksctl power-off --block-device=$dev
+done
+
+# identify target device by user to insert it
+lp1=$(mktemp --directory)
+[ "$(whoami)" != "root" ] || until [ "$target" ]; do
+	pgrep zenity > /dev/null || zenity --title="Clone Tails" --info --width=300 --text='<b>Plug the new USB stick in the computer.</b>\nAll the data on this USB stick will be lost.' &
+	lsblk --noheadings --paths --raw --nodeps --output NAME > $lp1/last
+	sleep 0.2
+	lsblk --noheadings --paths --raw --nodeps --output NAME > $lp1/now
+	target="$(diff $lp1/last $lp1/now | tail -1 | awk '{print $NF}' | head -c-1)"
+	rm $lp1/last $lp1/now
+done
+pkill zenity
+rm -r "$lp1"
+
+[ "$target" ] && sleep 2 && usb_dev=$(ls -l /dev/disk/by-id|grep usb|grep -v 'part.*->' \
+|sed -e 's/.*usb-/usb-/' -e 's#../..#/dev#' -e 's/^/ /' -e 's/$/ /'|sort -k3)
+
+if test -b "$target"
+then
+ leng=${#target}
+ leng1=$((leng - 1))
+ trunk=${target:0:leng1}
+ leng2=$((leng - 2))
+ trun2=${target:0:leng2}
+fi
+
+if [ $# -lt 2 ] && [ "$target" ]
+then
+ if ! test -b "$target" || test -b "$trunk" || test -b "$trun2" 
+ then
+  /bin/echo -e "$redback Bad target device $inversvid $target $resetvid"
+ fi
+fi
+
+# usage text
+
+if [ "$(whoami)" != "root" ] || [ $# -gt 1 ] || \
+! test -b "$target" || test -b "$trunk" || test -b "$trun2" 
+then
+ usage
+fi
+
+
+
+# checkpoint
+
+/bin/echo -en "$safetybelt
+It helps you select the target device in a safe way to avoid
+overwriting valuable data by mistake. $blueback Please double-check ${resetvid}
+at the final checkpoint! [press Enter to continue] $resetvid"
+echo ""
+/bin/echo -e "${inversvid} Please check that you will clone to the correct target device! ${resetvid}" 
+/bin/echo -e "${targ_dev}"
+/bin/echo -en "${inversvid}"
+lsblk -o NAME,MODEL,FSTYPE,LABEL,MOUNTPOINT,SIZE,NAME "$target"
+/bin/echo -e "${resetvid}"
+
+echo "$usb_dev"|grep -m1 "$target" > /dev/null
+if [ $? -ne 0 ]
+then
+ /bin/echo -en "$redback Not a USB device. Do you really want to overwrite $inversvid ${target} $resetvid$redback ? (y/N)$resetvid "
+ read ans
+ if [ "$ans" != "y" ]
+ then
+  exit
+ fi
+fi
+
+/bin/echo -e "$blueback Final checkpoint $resetvid"
+/bin/echo -en "Do you want to overwrite $inversvid ${target} $resetvid? (y/N) 
+"
+
+# make the boot device
+
+echo '          ***** pder: Persistence for Debian *****'
+
+echo "Trying to unmount partitions if mounted on the target device"
+umount "$target"*
+df | grep "$target"
+if [ $? -eq 0 ] && [ "$target" != "$RUNNING_TAILS_DEV" ]
+then
+ echo -e "$redback pder: could not unmount a partition on the target device $resetvid"
+ exit
+fi
+echo "$bar"
+echo -e "$inversvid Please wait until the process has finished and 'Done' is written $resetvid"
+
+echo "..... Modifying running device image in place .................................."
+# mount live medium read-write
+mount -o remount,rw /lib/live/mount/medium
+sleep 1
+cd /lib/live/mount/medium
+# creates backup of boot configuration files
+lp1=$(mktemp -d)
+for file in $(find -type f -name '*.cfg' -exec grep --files-with-matches 'noautologin' {} \;); do
+	cp -a $file "$lp1"
+done
+# update configuration to have persistence and skip welcome screen
+find ./ -type f -name '*.cfg' -exec sed --in-place 's/nopersistence/ persistence /g' {} \;
+find ./ -type f -name '*.cfg' -exec sed --in-place 's/noautologin/           /g' {} \;
+# creates backup of tails_instaler/gui.py
+cp -a /usr/lib/python3/dist-packages/tails_installer/gui.py{,.bak}
+# removes dialog requiring user to click 'close' in the GUI when tails-installer completes
+sed -i -z 's/dialog.run()\n        self.close()/self.close()/' /usr/lib/python3/dist-packages/tails_installer/gui.py
+cd /usr/local/bin
+# creates backup of tails-installer
+cp -a tails-installer{,.bak}
+# make Tails Installer auto-begin and auto-confirm whatever device it finds VERY DANGEROUS TO DATA!
+sed -i 's/Gtk.main()/win.confirmed = True\n        win.begin()\n        Gtk.main()/' tails-installer
+
+echo "..... Flash modified iso file to target ........................................"
+
+sudo --user=amnesia tails-installer --verbose	# sudo to run as amnesia user, not root
+
+# restores original grub configuration on running tails device if it is not the target
+cd "$lp1"
+#read -p "$lp1 check backups command"
+[ "$target" != "$RUNNING_TAILS_DEV" ] && for line in $(find); do mv ${line:2} /lib/live/mount/medium/${line:2}; done
+rm -r "$lp1"
+# restores tails-installer backup and original GUI behavior (For safety if users run it manually)
+mv /usr/lib/python3/dist-packages/tails_installer/gui.py{.bak,}
+mv /usr/local/bin/tails-installer{.bak,}
+sleep 1
+sync
+sleep 2
+partprobe 2> /dev/null
+sleep 2
+partn0=/dev/$(lsblk -l -o name "${target}" | tail -n1)
+
+echo "..... Create partition for persistence ........................................."
+
+echo 'n
+p
+
+
+
+w' | fdisk "${target}"
+sleep 2
+sync
+sleep 2
+prober
+
+partnr=/dev/$(lsblk -l -o name "${target}" | tail -n1)
+if ! test -b "$partnr"
+then
+ echo "The target's partition $partnr not found"
+ exit
+fi
+
+echo "..... Overwrite first mibibyte of partition for persistence ...................."
+
+dd if=/dev/zero of="$partnr" bs=1024 count=1024
+sleep 2
+sync
+partprobe 2> /dev/null
+sleep 2
+
+echo "..... Create file system in partition for persistence .........................."
+
+mkfs.ext4 -L persistence "$partnr"
+sleep 1
+if [ $? -ne 0 ]
+then
+ success=false
+fi
+sync
+sleep 2
+
+lp1=$(mktemp -d)
+
+echo "..... Copy '/live/overlay/' to persistence file system ........................."
+
+mount "$partnr" "$lp1"
+if [ $? -ne 0 ]
+then
+ success=false
+fi
+sleep 1
+rsync -PaSHAXv --del --mkpath /live/overlay/rw/home/ "$lp1"/rw/home	# persisting only home folder
+# copy /etc/shadow* to persist the user password otherwise there will not be one when the screen locks (5 minutes default)
+# FIXME artica is going to need to selectively persist the files it installs FIXME
+# you will find them in /usr and /lib most likely but other areas are possible, inspect /live/overlay/rw/ folder after installing necessary software for the offline signers.
+# tails refuses to boot if I persist anything beyond /home this way.
+echo
+if [ $? -ne 0 ]
+then
+ success=false
+fi
+
+echo "..... Write 'persistence.conf' ................................................."
+
+echo '/ union' > "$lp1"/persistence.conf
+sync
+umount "$lp1"
+sleep 1
+rm -r "$lp1"
+
+# final tasks
+
+sleep 1
+sync
+
+if [ "${target/mmc}" != "$target" ]
+then
+ read -p "Press Enter to continue, when you have unplugged the target device '$target'
+and maybe have plugged it back again"
+fi
+sleep 1
+partprobe 2> /dev/null
+sleep 1
+umount "${target}?" "${target}p?" 2> /dev/null
+sleep 1
+echo "$bar"
+lsblk -o NAME,MODEL,FSTYPE,LABEL,MOUNTPOINT,SIZE,NAME "$target"
+
+if $success
+then
+ /bin/echo -e "$greenback Done :-) $resetvid"
+else
+ /bin/echo -e "$redback failed :-( $resetvid"
+fi
